@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/Jigsaw-Code/outline-sdk/x/psiphon"
+	psi "github.com/Psiphon-Labs/psiphon-tunnel-core/ClientLibrary/clientlib"
 )
 
 var debugLog log.Logger = *log.New(io.Discard, "", 0)
@@ -65,14 +66,28 @@ func main() {
 	if err != nil {
 		log.Fatalf("Could not read config file: %v\n", err)
 	}
-	dialer, err := psiphon.NewStreamDialer(configJSON)
+
+	ctx := context.Background()
+
+	// The Psiphon data store directory must always be set
+	psiDataRootDirectory := "."
+	// The client platform must be set if not already present in the config JSON
+	psiClientPlatform := "outline_sdkexample"
+	params := psi.Parameters{
+		DataRootDirectory: &psiDataRootDirectory,
+		ClientPlatform:    &psiClientPlatform,
+	}
+
+	// Establish the Psiphon tunnel. This will block until the tunnel is established or
+	// an error occurs.
+	dialer, err := psiphon.NewStreamDialer(ctx, configJSON, "", params)
 	if err != nil {
 		log.Fatalf("Could not create dialer: %v\n", err)
 	}
 	defer dialer.Close()
-	// TODO: Wait for tunnels to be active.
-	time.Sleep(2 * time.Second)
+
 	dialContext := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		// Use the Psiphon tunnel as the transport for our HTTP client
 		return dialer.DialStream(ctx, addr)
 	}
 	httpClient := &http.Client{Transport: &http.Transport{DialContext: dialContext}, Timeout: 5 * time.Second}

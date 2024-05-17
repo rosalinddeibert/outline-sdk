@@ -21,46 +21,70 @@ package psiphon
 
 import (
 	"context"
-	"fmt"
 	"net"
 
 	"github.com/Jigsaw-Code/outline-sdk/transport"
-	psi "github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon"
+	psi "github.com/Psiphon-Labs/psiphon-tunnel-core/ClientLibrary/clientlib"
 )
 
 type PsiphonDialer struct {
-	cancel     context.CancelFunc
-	controller *psi.Controller
+	tunnel *psi.PsiphonTunnel
 }
 
+// NewStreamDialer creates a new Psiphon StreamDialer. It returns either when an error
+// occurs (including a configured timeout) or a Psiphon tunnel is established.
+//
+// The embeddedServerEntryList is a string that contains the initial Psiphon server
+// entries. If this is not supplied, a server list will be fetched before the first
+// connection attempt.
+//
+// You may either add your config customizations to the JSON or use the psi.Parameters
+// struct along with the exact config JSON provided by Psiphon.
+//
+//   - DataRootDirectory: The directory where Psiphon will store its data. Required.
+//
+//   - ClientPlatform: This can be as simple as "outline", or it can capture more
+//     information with underscore-delimited suffixes, like:
+//     "outline_<version>_<integrator>". These extra fields can be used to provide more
+//     detailed information in usage stats (available to Psiphon Inc.).
+//     Required if not already set in the config JSON.
+//
+//   - NetworkID: Can be "WIFI" or "MOBILE". Optional.
+//
+//   - EstablishTunnelTimeoutSeconds: Do not use. (It is set to 0 in the config and should
+//     not be overridden.)
+//
+//   - EmitDiagnosticNoticesToFiles: Only set to true when debugging Psiphon behaviour.
+//
+//   - DisableLocalSocksProxy, DisableLocalHTTPProxy: Do not use. Set by this function to
+//     prevent Psiphon from running local proxies.
+func NewStreamDialer(ctx context.Context, configJSON []byte, embeddedServerEntryList string, params psi.Parameters) (*PsiphonDialer, error) {
+	// We access the Psiphon tunnel directly through a dialer, so we have
+	// no need for local proxies.
+	t := true
+	params.DisableLocalSocksProxy = &t
+	params.DisableLocalHTTPProxy = &t
+
+	tunnel, err := psi.StartTunnel(ctx, configJSON, embeddedServerEntryList, params, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return &PsiphonDialer{tunnel}, nil
+}
+
+// DialStream establishes a connection to addr through the Psiphon tunnel.
 func (d *PsiphonDialer) DialStream(ctx context.Context, addr string) (transport.StreamConn, error) {
-	netConn, err := d.controller.Dial(addr, nil)
+	netConn, err := d.tunnel.Dial(addr)
 	if err != nil {
 		return nil, err
 	}
 	return streamConn{netConn}, nil
 }
 
+// Close stops the Psiphon tunnel. Safe to call even if the tunnel is not established.
 func (d *PsiphonDialer) Close() {
-	d.cancel()
-}
-
-func NewStreamDialer(configJSON []byte) (*PsiphonDialer, error) {
-	config, err := psi.LoadConfig([]byte(configJSON))
-	if err != nil {
-		return nil, fmt.Errorf("config load failed: %w", err)
-	}
-	err = config.Commit(false)
-	if err != nil {
-		return nil, fmt.Errorf("config commit failed: %w", err)
-	}
-	controller, err := psi.NewController(config)
-	if err != nil {
-		return nil, fmt.Errorf("controller creation failed: %w", err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	go controller.Run(ctx)
-	return &PsiphonDialer{cancel, controller}, nil
+	d.tunnel.Stop()
 }
 
 var _ transport.StreamDialer = (*PsiphonDialer)(nil)

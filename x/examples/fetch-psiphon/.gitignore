@@ -1,0 +1,5 @@
+# Psiphon config file
+*.json
+
+# Psiphon data store directory
+ca.psiphon.PsiphonTunnel.tunnel-core/

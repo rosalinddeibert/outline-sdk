@@ -145,14 +145,20 @@ func (d *Dialer) Start(ctx context.Context, config *DialerConfig) error {
 // Stop stops the Dialer background processes, releasing resources and allowing it to be reconfigured.
 // It returns when the Dialer is completely stopped.
 func (d *Dialer) Stop() error {
+	// Holding a lock while calling the stop function ensures that any concurrent call
+	// to Stop will wait for the first call to finish before returning, rather than
+	// returning immediately (because tunnel.stop is nil) and thereby indicating
+	// (erroneously) that the tunnel has been stopped.
+	// Stopping a tunnel happens quickly enough that this processing block shouldn't be
+	// a problem.
 	d.mu.Lock()
-	stop := d.stop
-	d.stop = nil
-	d.mu.Unlock()
-	if stop == nil {
+	defer d.mu.Unlock()
+	if d.stop == nil {
 		return errNotStartedStop
 	}
-	stop()
+	d.stop()
+	d.stop = nil
+	d.tunnel = nil
 	return nil
 }
 

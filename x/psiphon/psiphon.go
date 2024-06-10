@@ -60,7 +60,7 @@ type Dialer struct {
 	mu sync.Mutex
 	// Used by DialStream.
 	tunnel *psi.PsiphonTunnel
-	// Used by Stop. After calling, the caller must set d.stop and d.tunnel to nil.
+	// Used by Stop. After calling, the caller must set d.stop to nil.
 	stop func()
 	// Allows tests to override the tunnel creation.
 	startTunnel func(ctx context.Context, config *DialerConfig) (*psi.PsiphonTunnel, error)
@@ -104,6 +104,11 @@ func (d *Dialer) Start(ctx context.Context, config *DialerConfig) error {
 		return errors.New("config must not be nil")
 	}
 
+	var tunnel *psi.PsiphonTunnel
+	// Will be closed when d.startTunnel returns; at this point the tunnel may or may not
+	// be nil, but the variable is ready for use.
+	startTunnelSignal := make(chan struct{})
+
 	// Ensure that the tunnel establishment can be interrupted by Stop.
 	cancelCtx, cancel := context.WithCancel(ctx)
 	d.mu.Lock()
@@ -111,11 +116,25 @@ func (d *Dialer) Start(ctx context.Context, config *DialerConfig) error {
 		d.mu.Unlock()
 		return errors.New("tried to start dialer that is already running")
 	}
-	d.stop = cancel
+	d.stop = func() {
+		cancel()
+		<-startTunnelSignal
+		if tunnel != nil {
+			tunnel.Stop()
+		}
+	}
 	d.mu.Unlock()
 
 	// StartTunnel returns when a tunnel is established or an error occurs.
-	tunnel, err := d.startTunnel(cancelCtx, config)
+	var err error
+	tunnel, err = d.startTunnel(cancelCtx, config)
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	d.tunnel = tunnel        // may be nil
+	close(startTunnelSignal) // indicate (to stop) that the tunnel variable is available for access
+
 	if err != nil {
 		if err == psi.ErrTimeout {
 			// This can occur either because there was a timeout set in the tunnel config
@@ -129,36 +148,20 @@ func (d *Dialer) Start(ctx context.Context, config *DialerConfig) error {
 		return fmt.Errorf("psi.StartTunnel failed: %w", err)
 	}
 
-	d.mu.Lock()
-	d.tunnel = tunnel
-	// Now that we have a running tunnel, we need to include stopping it in our stop function.
-	d.stop = func() {
-		cancel()
-		// Waits until the tunnel is stopped.
-		tunnel.Stop()
-	}
-	d.mu.Unlock()
-
 	return nil
 }
 
 // Stop stops the Dialer background processes, releasing resources and allowing it to be reconfigured.
 // It returns when the Dialer is completely stopped.
 func (d *Dialer) Stop() error {
-	// Holding a lock while calling the stop function ensures that any concurrent call
-	// to Stop will wait for the first call to finish before returning, rather than
-	// returning immediately (because tunnel.stop is nil) and thereby indicating
-	// (erroneously) that the tunnel has been stopped.
-	// Stopping a tunnel happens quickly enough that this processing block shouldn't be
-	// a problem.
 	d.mu.Lock()
-	defer d.mu.Unlock()
-	if d.stop == nil {
+	stop := d.stop
+	d.stop = nil
+	d.mu.Unlock()
+	if stop == nil {
 		return errNotStartedStop
 	}
-	d.stop()
-	d.stop = nil
-	d.tunnel = nil
+	stop()
 	return nil
 }
 

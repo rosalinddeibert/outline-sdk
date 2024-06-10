@@ -26,7 +26,9 @@ import (
 )
 
 // The single [Dialer] we can have.
-var singletonDialer = Dialer{}
+var singletonDialer = Dialer{
+	startTunnel: startTunnel,
+}
 
 var (
 	errNotStartedDial = errors.New("dialer has not been started yet")
@@ -58,8 +60,10 @@ type Dialer struct {
 	mu sync.Mutex
 	// Used by DialStream.
 	tunnel *psi.PsiphonTunnel
-	// Used by Stop.
+	// Used by Stop. After calling, the caller must set d.stop and d.tunnel to nil.
 	stop func()
+	// Allows tests to override the tunnel creation.
+	startTunnel func(ctx context.Context, config *DialerConfig) (*psi.PsiphonTunnel, error)
 }
 
 var _ transport.StreamDialer = (*Dialer)(nil)
@@ -81,12 +85,7 @@ func (d *Dialer) DialStream(unusedContext context.Context, addr string) (transpo
 	return streamConn{netConn}, nil
 }
 
-// Start configures and runs the Dialer. It must be called before you can use the Dialer. It returns when the tunnel is ready for use.
-func (d *Dialer) Start(ctx context.Context, config *DialerConfig) error {
-	if config == nil {
-		return errors.New("config must not be nil")
-	}
-
+func startTunnel(ctx context.Context, config *DialerConfig) (*psi.PsiphonTunnel, error) {
 	// Disable Psiphon's local proxy servers, which we don't use.
 	// Note that these parameters override anything in the provider config.
 	trueValue := true
@@ -96,21 +95,35 @@ func (d *Dialer) Start(ctx context.Context, config *DialerConfig) error {
 		DisableLocalHTTPProxy:  &trueValue,
 	}
 
+	return psi.StartTunnel(ctx, config.ProviderConfig, "", params, nil, nil)
+}
+
+// Start configures and runs the Dialer. It must be called before you can use the Dialer. It returns when the tunnel is ready for use.
+func (d *Dialer) Start(ctx context.Context, config *DialerConfig) error {
+	if config == nil {
+		return errors.New("config must not be nil")
+	}
+
 	// Ensure that the tunnel establishment can be interrupted by Stop.
 	cancelCtx, cancel := context.WithCancel(ctx)
 	d.mu.Lock()
 	if d.stop != nil {
 		d.mu.Unlock()
-		return errors.New("tried to start dialer that is alread running")
+		return errors.New("tried to start dialer that is already running")
 	}
 	d.stop = cancel
 	d.mu.Unlock()
 
 	// StartTunnel returns when a tunnel is established or an error occurs.
-	tunnel, err := psi.StartTunnel(cancelCtx, config.ProviderConfig, "", params, nil, nil)
+	tunnel, err := d.startTunnel(cancelCtx, config)
 	if err != nil {
 		if err == psi.ErrTimeout {
+			// This can occur either because there was a timeout set in the tunnel config
+			// or because the context deadline was exceeded.
 			err = errTunnelTimeout
+			if ctx.Err() == context.DeadlineExceeded {
+				err = context.DeadlineExceeded
+			}
 		}
 		cancel()
 		return fmt.Errorf("psi.StartTunnel failed: %w", err)
@@ -121,6 +134,7 @@ func (d *Dialer) Start(ctx context.Context, config *DialerConfig) error {
 	// Now that we have a running tunnel, we need to include stopping it in our stop function.
 	d.stop = func() {
 		cancel()
+		// Waits until the tunnel is stopped.
 		tunnel.Stop()
 	}
 	d.mu.Unlock()

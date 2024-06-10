@@ -2,6 +2,9 @@ module github.com/Jigsaw-Code/outline-sdk/x
 
 go 1.21
 
+// TEMP
+replace github.com/Psiphon-Labs/psiphon-tunnel-core => ../../../psiphon-tunnel-core
+
 require (
 	github.com/Jigsaw-Code/outline-sdk v0.0.16
 	// Use github.com/Psiphon-Labs/psiphon-tunnel-core@staging-client as per

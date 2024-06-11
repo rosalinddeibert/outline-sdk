@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 
 	"github.com/Jigsaw-Code/outline-sdk/transport"
 	psi "github.com/Psiphon-Labs/psiphon-tunnel-core/ClientLibrary/clientlib"
@@ -31,9 +32,11 @@ var singletonDialer = Dialer{
 }
 
 var (
-	errNotStartedDial = errors.New("dialer has not been started yet")
-	errNotStartedStop = errors.New("tried to stop dialer that is not running")
-	errTunnelTimeout  = errors.New("tunnel establishment timed out")
+	// TODO: check error usage
+	errNotStartedDial       = errors.New("dialer has not been started yet")
+	errNotStartedStop       = errors.New("tried to stop dialer that is not running")
+	errTunnelTimeout        = errors.New("tunnel establishment timed out")
+	errTunnelAlreadyStarted = errors.New("tunnel already started")
 )
 
 // DialerConfig specifies the parameters for [Dialer].
@@ -56,12 +59,16 @@ type DialerConfig struct {
 // called before you can start it again with a new configuration. Dialer.Stop should be called
 // when you no longer need the Dialer in order to release resources.
 type Dialer struct {
+	tunnel atomic.Pointer[psi.PsiphonTunnel]
+	// It is (and must be) okay for this function to be called multiple times concurrently
+	// or in series.
+	stop atomic.Pointer[func() error]
+	dial func(context.Context, string) (transport.StreamConn, error)
+
+	started atomic.Bool
 	// Controls the Dialer state and Psiphon's global state.
 	mu sync.Mutex
-	// Used by DialStream.
-	tunnel *psi.PsiphonTunnel
 	// Used by Stop. After calling, the caller must set d.stop to nil.
-	stop func()
 	// Allows tests to override the tunnel creation.
 	startTunnel func(ctx context.Context, config *DialerConfig) (*psi.PsiphonTunnel, error)
 }
@@ -72,9 +79,9 @@ var _ transport.StreamDialer = (*Dialer)(nil)
 // The context is not used because Psiphon's implementation doesn't support it. If you need cancellation,
 // you will need to add it independently.
 func (d *Dialer) DialStream(unusedContext context.Context, addr string) (transport.StreamConn, error) {
-	d.mu.Lock()
-	tunnel := d.tunnel
-	d.mu.Unlock()
+	fmt.Println("*****************DialStream started")
+	defer fmt.Println("*****************DialStream ended")
+	tunnel := d.tunnel.Load()
 	if tunnel == nil {
 		return nil, errNotStartedDial
 	}
@@ -100,53 +107,76 @@ func startTunnel(ctx context.Context, config *DialerConfig) (*psi.PsiphonTunnel,
 
 // Start configures and runs the Dialer. It must be called before you can use the Dialer. It returns when the tunnel is ready for use.
 func (d *Dialer) Start(ctx context.Context, config *DialerConfig) error {
+	fmt.Println("*****************Start started")
+	defer fmt.Println("*****************Start ended")
 	if config == nil {
 		return errors.New("config must not be nil")
 	}
 
-	var tunnel *psi.PsiphonTunnel
-	// Will be closed when d.startTunnel returns; at this point the tunnel may or may not
-	// be nil, but the variable is ready for use.
-	startTunnelSignal := make(chan struct{})
-
-	// Ensure that the tunnel establishment can be interrupted by Stop.
-	cancelCtx, cancel := context.WithCancel(ctx)
-	d.mu.Lock()
-	if d.stop != nil {
-		d.mu.Unlock()
-		return errors.New("tried to start dialer that is already running")
-	}
-	d.stop = func() {
-		cancel()
-		<-startTunnelSignal
-		if tunnel != nil {
-			tunnel.Stop()
-		}
-	}
-	defer close(startTunnelSignal) // indicate (to stop) that the tunnel variable is available for access
-	d.mu.Unlock()
-
-	// StartTunnel returns when a tunnel is established or an error occurs.
-	var err error
-	tunnel, err = d.startTunnel(cancelCtx, config)
-
-	select {
-	case <-ctx.Done():
-		// Context was canceled before the tunnel was established.
-		if tunnel != nil {
-			tunnel.Stop()
-			tunnel = nil
-		}
-		return fmt.Errorf("tunnel establishment interrupted: %w", err)
-	default:
-	}
-
+	// The mutex is locked only in this method, and is used to prevent concurrent calls to
+	// Start from returning before the tunnel is started (or failed).
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	d.tunnel = tunnel // may be nil
+	if d.tunnel.Load() != nil {
+		return errTunnelAlreadyStarted
+	}
+	// d.tunnel only gets set to a non-nil value in this function, and we're inside a
+	// locked mutex, so we can be sure that it will remain nil until we set it below.
+
+	startedTunnelSignal := make(chan struct{})
+	defer close(startedTunnelSignal)
+	tunnelCh := make(chan *psi.PsiphonTunnel)
+	errCh := make(chan error)
+	cancelCtx, cancel := context.WithCancel(ctx)
+
+	// The stop function is not called from within a mutex.
+	// It must be safe to call concurrently and multiple times.
+	stop := func() error {
+		cancel()
+		// Wait for startTunnel to return (and note that it may return success or error at
+		// this point).
+		<-startedTunnelSignal
+		tunnel := d.tunnel.Swap(nil)
+		if tunnel == nil {
+			return errNotStartedStop
+		}
+		// Only the first call to this function will actually get the tunnel and be able
+		// to stop it; subsequent calls will get nil. (However, tunnel.Stop is itself
+		// threadsafe, so it would be okay even if we called it multiple times or
+		// concurrently.)
+		tunnel.Stop()
+		return nil
+	}
+	d.stop.Store(&stop)
+
+	go func() {
+		// In the case of an error being returned from StartTunnel, canceling the context
+		// is the only cleanup necessary, and it can be done regardless.
+		defer cancel()
+
+		// StartTunnel returns when a tunnel is established or an error occurs.
+		tunnel, err := d.startTunnel(cancelCtx, config)
+
+		if err != nil {
+			errCh <- err
+		} else {
+			tunnelCh <- tunnel
+		}
+	}()
+
+	var err error
+	select {
+	case tunnel := <-tunnelCh:
+		d.tunnel.Store(tunnel)
+	case err = <-errCh:
+	}
 
 	if err != nil {
+		// If there was an error, the context has already been canceled and there is no
+		// more cleanup to be done.
+		d.stop.Store(nil)
+
 		if err == psi.ErrTimeout {
 			// This can occur either because there was a timeout set in the tunnel config
 			// or because the context deadline was exceeded.
@@ -155,8 +185,8 @@ func (d *Dialer) Start(ctx context.Context, config *DialerConfig) error {
 				err = context.DeadlineExceeded
 			}
 		}
-		cancel()
-		return fmt.Errorf("psi.StartTunnel failed: %w", err)
+
+		return err
 	}
 
 	return nil
@@ -165,15 +195,13 @@ func (d *Dialer) Start(ctx context.Context, config *DialerConfig) error {
 // Stop stops the Dialer background processes, releasing resources and allowing it to be reconfigured.
 // It returns when the Dialer is completely stopped.
 func (d *Dialer) Stop() error {
-	d.mu.Lock()
-	stop := d.stop
-	d.stop = nil
-	d.mu.Unlock()
+	fmt.Println("*****************Stop started")
+	defer fmt.Println("*****************Stop ended")
+	stop := d.stop.Swap(nil)
 	if stop == nil {
 		return errNotStartedStop
 	}
-	stop()
-	return nil
+	return (*stop)()
 }
 
 // GetSingletonDialer returns the single Psiphon dialer instance.

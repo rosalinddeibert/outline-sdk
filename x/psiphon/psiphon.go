@@ -123,17 +123,28 @@ func (d *Dialer) Start(ctx context.Context, config *DialerConfig) error {
 			tunnel.Stop()
 		}
 	}
+	defer close(startTunnelSignal) // indicate (to stop) that the tunnel variable is available for access
 	d.mu.Unlock()
 
 	// StartTunnel returns when a tunnel is established or an error occurs.
 	var err error
 	tunnel, err = d.startTunnel(cancelCtx, config)
 
+	select {
+	case <-ctx.Done():
+		// Context was canceled before the tunnel was established.
+		if tunnel != nil {
+			tunnel.Stop()
+			tunnel = nil
+		}
+		return fmt.Errorf("tunnel establishment interrupted: %w", err)
+	default:
+	}
+
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	d.tunnel = tunnel        // may be nil
-	close(startTunnelSignal) // indicate (to stop) that the tunnel variable is available for access
+	d.tunnel = tunnel // may be nil
 
 	if err != nil {
 		if err == psi.ErrTimeout {

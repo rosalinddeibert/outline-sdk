@@ -80,31 +80,22 @@ func main() {
 
 	// Start the Psiphon dialer.
 	dialer := psiphon.GetSingletonDialer()
-	fmt.Println("!!!!!!!!!!!Starting Psiphon dialer...")
 	if err := dialer.Start(context.Background(), config); err != nil {
 		log.Fatalf("Could not start dialer: %v\n", err)
 	}
-	fmt.Println("!!!!!!!!!!!Psiphon dialer started")
-	defer func() {
-		fmt.Println("!!!!!!!!!!!Stopping Psiphon dialer...")
-		dialer.Stop()
-		fmt.Println("!!!!!!!!!!!Psiphon dialer stopped")
-	}()
+	defer dialer.Stop()
 
 	// Set up HTTP client.
 	dialContext := func(ctx context.Context, network, addr string) (net.Conn, error) {
-		fmt.Println("!!!!!!!!!!!Dialing", addr)
 		return dialer.DialStream(ctx, addr)
 	}
 	httpClient := &http.Client{Transport: &http.Transport{DialContext: dialContext}, Timeout: 5 * time.Second}
 
 	// Issue HTTP request.
-	fmt.Println("!!!!!!!!!!!Issuing HTTP request...")
 	req, err := http.NewRequest(*methodFlag, url, nil)
 	if err != nil {
 		log.Fatalln("Failed to create request:", err)
 	}
-	fmt.Println("!!!!!!!!!!!Request created")
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		log.Fatalf("HTTP request failed: %v\n", err)

@@ -121,8 +121,6 @@ func (d *Dialer) Start(ctx context.Context, config *DialerConfig) error {
 
 	startedTunnelSignal := make(chan struct{})
 	defer close(startedTunnelSignal)
-	tunnelCh := make(chan *psi.PsiphonTunnel)
-	errCh := make(chan error)
 	cancelCtx, cancel := context.WithCancel(ctx)
 
 	// The stop function is not called from within a mutex.
@@ -145,23 +143,8 @@ func (d *Dialer) Start(ctx context.Context, config *DialerConfig) error {
 	}
 	d.stop.Store(&stop)
 
-	go func() {
-		// StartTunnel returns when a tunnel is established or an error occurs.
-		tunnel, err := d.startTunnel(cancelCtx, config)
-
-		if err != nil {
-			errCh <- err
-		} else {
-			tunnelCh <- tunnel
-		}
-	}()
-
-	var err error
-	select {
-	case tunnel := <-tunnelCh:
-		d.tunnel.Store(tunnel)
-	case err = <-errCh:
-	}
+	// StartTunnel returns when a tunnel is established or an error occurs.
+	tunnel, err := d.startTunnel(cancelCtx, config)
 
 	if err != nil {
 		// If there was an error, the context has already been canceled and there is no
@@ -184,6 +167,8 @@ func (d *Dialer) Start(ctx context.Context, config *DialerConfig) error {
 
 		return err
 	}
+
+	d.tunnel.Store(tunnel)
 
 	return nil
 }

@@ -17,7 +17,6 @@ package psiphon
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -79,8 +78,6 @@ var _ transport.StreamDialer = (*Dialer)(nil)
 // The context is not used because Psiphon's implementation doesn't support it. If you need cancellation,
 // you will need to add it independently.
 func (d *Dialer) DialStream(unusedContext context.Context, addr string) (transport.StreamConn, error) {
-	fmt.Println("*****************DialStream started")
-	defer fmt.Println("*****************DialStream ended")
 	tunnel := d.tunnel.Load()
 	if tunnel == nil {
 		return nil, errNotStartedDial
@@ -107,8 +104,6 @@ func startTunnel(ctx context.Context, config *DialerConfig) (*psi.PsiphonTunnel,
 
 // Start configures and runs the Dialer. It must be called before you can use the Dialer. It returns when the tunnel is ready for use.
 func (d *Dialer) Start(ctx context.Context, config *DialerConfig) error {
-	fmt.Println("*****************Start started")
-	defer fmt.Println("*****************Start ended")
 	if config == nil {
 		return errors.New("config must not be nil")
 	}
@@ -151,10 +146,6 @@ func (d *Dialer) Start(ctx context.Context, config *DialerConfig) error {
 	d.stop.Store(&stop)
 
 	go func() {
-		// In the case of an error being returned from StartTunnel, canceling the context
-		// is the only cleanup necessary, and it can be done regardless.
-		defer cancel()
-
 		// StartTunnel returns when a tunnel is established or an error occurs.
 		tunnel, err := d.startTunnel(cancelCtx, config)
 
@@ -184,7 +175,12 @@ func (d *Dialer) Start(ctx context.Context, config *DialerConfig) error {
 			if ctx.Err() == context.DeadlineExceeded {
 				err = context.DeadlineExceeded
 			}
+		} else if ctx.Err() == context.Canceled {
+			err = context.Canceled
 		}
+
+		// Ensure this is below the ctx.Err() checks above
+		cancel()
 
 		return err
 	}
@@ -195,8 +191,6 @@ func (d *Dialer) Start(ctx context.Context, config *DialerConfig) error {
 // Stop stops the Dialer background processes, releasing resources and allowing it to be reconfigured.
 // It returns when the Dialer is completely stopped.
 func (d *Dialer) Stop() error {
-	fmt.Println("*****************Stop started")
-	defer fmt.Println("*****************Stop ended")
 	stop := d.stop.Swap(nil)
 	if stop == nil {
 		return errNotStartedStop

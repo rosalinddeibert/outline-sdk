@@ -225,4 +225,100 @@ func TestDialer_Concurrent(t *testing.T) {
 	cancel()
 	require.ErrorIs(t, err1, context.Canceled)
 	require.NoError(t, err2)
+
+	// Attempt to call start during start
+	// Set a no-op startTunnel that will take a while.
+	dialer.startTunnel = func(ctx context.Context, config *DialerConfig) (*psi.PsiphonTunnel, error) {
+		// Wait a bit before returning.
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
+		return &psi.PsiphonTunnel{}, nil
+	}
+	ctx, cancel = context.WithCancel(context.Background())
+	go func() {
+		errCh1 <- dialer.Start(ctx, cfg)
+	}()
+	go func() {
+		time.Sleep(20 * time.Millisecond) // delay the start a bit
+		errCh2 <- dialer.Start(ctx, cfg)
+	}()
+	err1 = <-errCh1
+	err2 = <-errCh2
+	cancel()
+	require.NoError(t, err1)
+	require.ErrorIs(t, err2, errTunnelAlreadyStarted)
+	require.NoError(t, dialer.Stop())
+
 }
+
+func TestDialStream_Stopped(t *testing.T) {
+	// Create minimal config.
+	cfg, delete := newTestConfig(t)
+	defer delete()
+
+	dialer := GetSingletonDialer()
+
+	// Regardless of what we do below, restore the real startTunnel.
+	defer func() {
+		dialer.startTunnel = startTunnel
+	}()
+
+	// Set a no-op startTunnel
+	dialer.startTunnel = func(ctx context.Context, config *DialerConfig) (*psi.PsiphonTunnel, error) {
+		return &psi.PsiphonTunnel{}, nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	err := dialer.Start(ctx, cfg)
+
+	require.NoError(t, err)
+
+	require.NoError(t, dialer.Stop())
+
+	_, err = dialer.DialStream(context.Background(), "")
+	require.ErrorIs(t, err, errNotStartedDial)
+
+	cancel()
+}
+
+func TestDialStream_DialFailed(t *testing.T) {
+	// Create minimal config.
+	cfg, delete := newTestConfig(t)
+	defer delete()
+
+	dialer := GetSingletonDialer()
+
+	// Regardless of what we do below, restore the real startTunnel.
+	defer func() {
+		dialer.startTunnel = startTunnel
+	}()
+
+	// Set a no-op startTunnel
+	dialer.startTunnel = func(ctx context.Context, config *DialerConfig) (*psi.PsiphonTunnel, error) {
+		return &psi.PsiphonTunnel{}, nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	err := dialer.Start(ctx, cfg)
+
+	require.NoError(t, err)
+
+	// This will fail because the call to tunnel.Dial will fail with "tunnel not started"
+	// because there is no real tunnel.
+	// I would prefer to mock the response of tunnel.Dial but I haven't had any success with that.
+	_, err = dialer.DialStream(context.Background(), "")
+	require.Error(t, err)
+
+	require.NoError(t, dialer.Stop())
+
+	cancel()
+
+}
+
+// Write a test that mocks DialStream returning succesfully, and then test that it can be
+// called concurrently with Stop, Start and itself.

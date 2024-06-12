@@ -62,9 +62,7 @@ type Dialer struct {
 	// It is (and must be) okay for this function to be called multiple times concurrently
 	// or in series.
 	stop atomic.Pointer[func() error]
-	dial func(context.Context, string) (transport.StreamConn, error)
 
-	started atomic.Bool
 	// Controls the Dialer state and Psiphon's global state.
 	mu sync.Mutex
 	// Used by Stop. After calling, the caller must set d.stop to nil.
@@ -132,7 +130,9 @@ func (d *Dialer) Start(ctx context.Context, config *DialerConfig) error {
 		<-startedTunnelSignal
 		tunnel := d.tunnel.Swap(nil)
 		if tunnel == nil {
-			return errNotStartedStop
+			// We were connecting, but not yet connected; we interrupted the connection
+			// sequence by canceling the context. There is no further cleanup to do.
+			return nil
 		}
 		// Only the first call to this function will actually get the tunnel and be able
 		// to stop it; subsequent calls will get nil. (However, tunnel.Stop is itself
